@@ -32,11 +32,17 @@ jobs:
       - name: Create VM (skip if one exists)
         env:
           SUBNET_ID: ${{ secrets.SUBNET_ID }}
+          OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: "True"
+          SUPPRESS_LABEL_WARNING: "True"
         run: |
+          chmod 600 ~/.oci/config
           export SSH_PUBKEY_FILE=$HOME/key.pub
+          oci iam region list > /dev/null || { echo "OCI LOGIN FAILED - check secrets"; exit 1; }
+          echo "Login OK"
           N=$(oci compute instance list --compartment-id "${{ secrets.OCI_TENANCY }}" \
-            --display-name free-vm \
-            --query 'length(data[?"lifecycle-state"!=`TERMINATED`])' --raw-output)
-          if [ "$N" != "0" ]; then echo "VM already exists, nothing to do"; exit 0; fi
+            --display-name free-vm --all \
+            --query 'length(data[?"lifecycle-state"!=`TERMINATED`])' --raw-output 2>&1) || { echo "LIST FAILED: $N"; exit 1; }
+          echo "Existing free-vm instances: $N"
+          if [ "$N" != "0" ] && [ "$N" != "" ]; then echo "VM already exists, nothing to do"; exit 0; fi
           chmod +x oci_free_vm.sh
           ./oci_free_vm.sh create
