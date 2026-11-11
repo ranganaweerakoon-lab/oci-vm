@@ -1,0 +1,42 @@
+name: create-oci-vm
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+concurrency: oci-vm
+jobs:
+  create:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install OCI CLI
+        run: pip install oci-cli
+      - name: Configure OCI
+        env:
+          OCI_KEY: ${{ secrets.OCI_KEY }}
+          SSH_PUBKEY: ${{ secrets.SSH_PUBKEY }}
+        run: |
+          mkdir -p ~/.oci
+          printf '%s\n' "$OCI_KEY" > ~/.oci/key.pem
+          chmod 600 ~/.oci/key.pem
+          cat > ~/.oci/config <<EOF
+          [DEFAULT]
+          user=${{ secrets.OCI_USER }}
+          fingerprint=${{ secrets.OCI_FINGERPRINT }}
+          tenancy=${{ secrets.OCI_TENANCY }}
+          region=ap-singapore-1
+          key_file=$HOME/.oci/key.pem
+          EOF
+          printf '%s\n' "$SSH_PUBKEY" > ~/key.pub
+      - name: Create VM (skip if one exists)
+        env:
+          SUBNET_ID: ${{ secrets.SUBNET_ID }}
+        run: |
+          export SSH_PUBKEY_FILE=$HOME/key.pub
+          N=$(oci compute instance list --compartment-id "${{ secrets.OCI_TENANCY }}" \
+            --display-name free-vm \
+            --query 'length(data[?"lifecycle-state"!=`TERMINATED`])' --raw-output)
+          if [ "$N" != "0" ]; then echo "VM already exists, nothing to do"; exit 0; fi
+          chmod +x oci_free_vm.sh
+          ./oci_free_vm.sh create
