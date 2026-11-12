@@ -23,7 +23,7 @@ cmd="${1:-create}"
 
 if [[ "$cmd" == "resize" ]]; then
   INST="${2:?instance ocid required}"
-  NEW_OCPUS="${OCPUS_NEW:-4}"; NEW_MEM="${MEMORY_NEW:-24}"
+  NEW_OCPUS="${OCPUS_NEW:-1}"; NEW_MEM="${MEMORY_NEW:-6}"
   if (( NEW_OCPUS > MAX_A1_OCPUS || NEW_MEM > MAX_A1_MEM )); then
     echo "Refusing: exceeds Always Free A1 limit"; exit 1
   fi
