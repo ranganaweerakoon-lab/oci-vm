@@ -3,60 +3,35 @@
 
 # ============================================================
 # ORACLE CLOUD ALWAYS FREE A1 INSTANCE HUNTER
-#
-# Region:       Singapore (ap-singapore-1)
-# Shape:        VM.Standard.A1.Flex
-# OCPU:         1
-# RAM:          6 GB
-# Boot Volume:  50 GB
-# OS:           Ubuntu 22.04
-#
-# Uses existing environment variables and OCI config.
+# Singapore | VM.Standard.A1.Flex | 1 OCPU | 6 GB RAM
 # ============================================================
 
 set -Eeuo pipefail
 
 # ------------------------------------------------------------
-# CONFIGURATION - EXISTING VARIABLE NAMES PRESERVED
+# CONFIGURATION - ORIGINAL VARIABLE NAMES PRESERVED
 # ------------------------------------------------------------
 
 PROFILE="${OCI_PROFILE:-DEFAULT}"
 CONFIG="${OCI_CLI_CONFIG_FILE:-$HOME/.oci/config}"
-
 REGION="${OCI_REGION:-ap-singapore-1}"
 
-TENANCY="$(
-    awk -F= -v p="[$PROFILE]" '
-        $0==p { f=1; next }
-        /^\[/ { f=0 }
-        f && $1=="tenancy" {
-            print $2
-            exit
-        }
-    ' "$CONFIG" | tr -d ' '
-)"
-
-COMPARTMENT="${COMPARTMENT_ID:-$TENANCY}"
-
-SHAPE_KIND="${SHAPE:-A1}"
+NAME="${VM_NAME:-free-vm}"
 
 OCPUS="${OCPUS:-1}"
 MEMORY_GB="${MEMORY_GB:-6}"
 BOOT_GB="${BOOT_GB:-50}"
 
-NAME="${VM_NAME:-free-vm}"
+SHAPE_KIND="${SHAPE:-A1}"
 
-# Existing OCI A1 Always Free allowance
-MAX_A1_OCPUS=2
-MAX_A1_MEM=12
-
-# Retry settings
 INITIAL_DELAY="${SLEEP:-120}"
 MAX_DELAY=900
 JITTER=60
 
-# Existing files
-SUCCESS_FILE="${HOME}/oci-a1-success.txt"
+MAX_A1_OCPUS=2
+MAX_A1_MEM=12
+
+SUCCESS_FILE="$HOME/oci-a1-success.txt"
 LOCK_FILE="/tmp/oci-a1-hunter.lock"
 
 # ------------------------------------------------------------
@@ -73,16 +48,16 @@ die() {
 }
 
 # ------------------------------------------------------------
-# LOCK - PREVENT DUPLICATE RUNNERS
+# LOCK
 # ------------------------------------------------------------
 
 command -v flock >/dev/null 2>&1 ||
-    die "flock is required."
+    die "flock is not installed."
 
 exec 9>"$LOCK_FILE"
 
 if ! flock -n 9; then
-    log "Another instance hunter is already running."
+    log "Another hunter is already running."
     exit 0
 fi
 
@@ -95,28 +70,47 @@ oci_() {
 }
 
 # ------------------------------------------------------------
-# VALIDATE CONFIGURATION
+# DEPENDENCIES
 # ------------------------------------------------------------
 
+command -v oci >/dev/null 2>&1 ||
+    die "OCI CLI not installed."
+
+command -v python3 >/dev/null 2>&1 ||
+    die "Python3 not installed."
+
 [[ -f "$CONFIG" ]] ||
-    die "OCI config not found: $CONFIG"
+    die "OCI configuration file not found: $CONFIG"
+
+# ------------------------------------------------------------
+# TENANCY
+# ------------------------------------------------------------
+
+TENANCY="$(
+    awk -F= -v p="[$PROFILE]" '
+        $0==p { found=1; next }
+        /^\[/ { found=0 }
+        found && $1=="tenancy" {
+            print $2
+            exit
+        }
+    ' "$CONFIG" | tr -d ' '
+)"
 
 [[ -n "$TENANCY" ]] ||
     die "Could not retrieve tenancy OCID."
 
 COMPARTMENT="${COMPARTMENT_ID:-$TENANCY}"
 
+# ------------------------------------------------------------
+# VALIDATION
+# ------------------------------------------------------------
+
 : "${SUBNET_ID:?SUBNET_ID is required}"
 : "${SSH_PUBKEY_FILE:?SSH_PUBKEY_FILE is required}"
 
 [[ -f "$SSH_PUBKEY_FILE" ]] ||
     die "SSH public key file not found."
-
-command -v oci >/dev/null 2>&1 ||
-    die "OCI CLI is not installed."
-
-command -v python3 >/dev/null 2>&1 ||
-    die "Python3 is required."
 
 [[ "$OCPUS" =~ ^[0-9]+$ ]] ||
     die "Invalid OCPUS."
@@ -127,40 +121,42 @@ command -v python3 >/dev/null 2>&1 ||
 [[ "$BOOT_GB" =~ ^[0-9]+$ ]] ||
     die "Invalid BOOT_GB."
 
+[[ "$INITIAL_DELAY" =~ ^[0-9]+$ ]] ||
+    die "Invalid SLEEP."
+
+(( INITIAL_DELAY >= 30 )) ||
+    die "SLEEP must be at least 30 seconds."
+
 # ------------------------------------------------------------
-# SHAPE CONFIGURATION
+# SHAPE
 # ------------------------------------------------------------
 
-if [[ "$SHAPE_KIND" == "A1" ]]; then
-
-    SHAPE_NAME="VM.Standard.A1.Flex"
-
-    (( OCPUS >= 1 && OCPUS <= MAX_A1_OCPUS )) ||
-        die "A1 Always Free allowance: maximum 2 OCPUs."
-
-    (( MEMORY_GB >= OCPUS && MEMORY_GB <= MAX_A1_MEM )) ||
-        die "Invalid A1 memory allocation."
-
-    (( BOOT_GB >= 47 && BOOT_GB <= 200 )) ||
-        die "Invalid boot volume size."
-
-    SHAPE_ARGS=(
-        --shape-config
-        "{\"ocpus\":$OCPUS,\"memoryInGBs\":$MEMORY_GB}"
-    )
-
-else
-
-    die "This hunter is configured for A1 only. Set SHAPE=A1."
-
+if [[ "$SHAPE_KIND" != "A1" ]]; then
+    die "This script supports A1 only."
 fi
 
+SHAPE_NAME="VM.Standard.A1.Flex"
+
+(( OCPUS >= 1 && OCPUS <= MAX_A1_OCPUS )) ||
+    die "A1 Always Free allowance: maximum 2 OCPUs."
+
+(( MEMORY_GB >= OCPUS && MEMORY_GB <= MAX_A1_MEM )) ||
+    die "Invalid A1 memory allocation."
+
+(( BOOT_GB >= 47 && BOOT_GB <= 200 )) ||
+    die "Invalid boot volume size."
+
+SHAPE_ARGS=(
+    --shape-config
+    "{\"ocpus\":$OCPUS,\"memoryInGBs\":$MEMORY_GB}"
+)
+
 # ------------------------------------------------------------
-# STARTUP INFORMATION
+# STARTUP
 # ------------------------------------------------------------
 
 log "============================================"
-log "ORACLE ALWAYS FREE A1 HUNTER"
+log "ORACLE A1 ALWAYS FREE HUNTER"
 log "============================================"
 
 log "Region:       $REGION"
@@ -176,46 +172,79 @@ log "============================================"
 
 # ------------------------------------------------------------
 # CHECK EXISTING INSTANCE
+# Exit 0: no instance found
+# Exit 0 with output: existing instance found
+# Exit 1: OCI/API error
 # ------------------------------------------------------------
 
 check_existing() {
 
     local result
+    local error_file
+    local status
 
-    result="$(oci_ compute instance list \
+    error_file="$(mktemp)"
+
+    if result="$(oci_ compute instance list \
         --compartment-id "$COMPARTMENT" \
         --all \
-        --output json)" || return 1
+        --output json 2>"$error_file")"; then
+        status=0
+    else
+        status=$?
+    fi
+
+    if (( status != 0 )); then
+        log "Failed to list existing instances:" >&2
+        cat "$error_file" >&2
+        rm -f "$error_file"
+        return 1
+    fi
+
+    rm -f "$error_file"
 
     python3 -c '
-import json, sys
+import json
+import sys
 
 name = sys.argv[1]
-data = json.load(sys.stdin)
+
+try:
+    data = json.load(sys.stdin)
+except Exception as error:
+    print("Invalid OCI JSON response:", error, file=sys.stderr)
+    sys.exit(2)
 
 for item in data.get("data", []):
     if item.get("display-name") == name:
         state = item.get("lifecycle-state", "")
+
         if state != "TERMINATED":
             print(item.get("id", "") + "|" + state)
             sys.exit(0)
 ' "$NAME" <<< "$result"
 }
 
-EXISTING="$(check_existing)" ||
-    die "Could not check existing instances."
+# ------------------------------------------------------------
+# INITIAL INSTANCE CHECK
+# ------------------------------------------------------------
 
-if [[ -n "$EXISTING" ]]; then
-    log "An instance with this name already exists."
-    log "$EXISTING"
-    exit 0
+if EXISTING="$(check_existing)"; then
+
+    if [[ -n "$EXISTING" ]]; then
+        log "Existing instance found: $EXISTING"
+        exit 0
+    fi
+
+else
+    die "Could not check existing instances."
 fi
 
 # ------------------------------------------------------------
 # FIND UBUNTU IMAGE
 # ------------------------------------------------------------
 
-log "Finding latest compatible Ubuntu 22.04 image..."
+log "Finding Ubuntu 22.04 image..."
 
 IMAGE_ID="$(oci_ compute image list \
     --compartment-id "$COMPARTMENT" \
@@ -226,15 +255,15 @@ IMAGE_ID="$(oci_ compute image list \
     --sort-order DESC \
     --query 'data[0].id' \
     --raw-output)" ||
-    die "Failed to retrieve Ubuntu image."
+    die "Ubuntu image lookup failed."
 
 [[ -n "$IMAGE_ID" && "$IMAGE_ID" != "null" ]] ||
     die "No compatible Ubuntu image found."
 
-log "Image ID: $IMAGE_ID"
+log "Ubuntu image: $IMAGE_ID"
 
 # ------------------------------------------------------------
-# GET AVAILABILITY DOMAINS
+# AVAILABILITY DOMAINS
 # ------------------------------------------------------------
 
 log "Retrieving availability domains..."
@@ -242,7 +271,7 @@ log "Retrieving availability domains..."
 AD_JSON="$(oci_ iam availability-domain list \
     --compartment-id "$TENANCY" \
     --output json)" ||
-    die "Could not retrieve availability domains."
+    die "Availability domain lookup failed."
 
 mapfile -t ADS < <(
     python3 -c '
@@ -253,7 +282,7 @@ for item in json.load(sys.stdin).get("data", []):
 )
 
 (( ${#ADS[@]} > 0 )) ||
-    die "No availability domains found."
+    die "No availability domains returned."
 
 log "Availability domains: ${ADS[*]}"
 
@@ -267,19 +296,21 @@ DELAY="$INITIAL_DELAY"
 while true; do
 
     log "============================================"
-    log "Starting new capacity check round."
+    log "NEW CAPACITY CHECK ROUND"
     log "============================================"
 
-    # Always check for an existing instance first.
-    EXISTING="$(check_existing)" ||
-        die "Cannot verify existing instances."
+    # Check for an existing VM before every round.
 
-    if [[ -n "$EXISTING" ]]; then
+    if EXISTING="$(check_existing)"; then
 
-        log "Existing instance detected!"
-        printf '%s\n' "$EXISTING" | tee "$SUCCESS_FILE"
-        exit 0
+        if [[ -n "$EXISTING" ]]; then
+            log "Instance detected: $EXISTING"
+            printf '%s\n' "$EXISTING" > "$SUCCESS_FILE"
+            exit 0
+        fi
 
+    else
+        die "Existing-instance check failed."
     fi
 
     for AD in "${ADS[@]}"; do
@@ -288,10 +319,12 @@ while true; do
 
         log "--------------------------------------------"
         log "Attempt: $ATTEMPT"
-        log "Availability domain: $AD"
+        log "AD: $AD"
         log "Shape: $SHAPE_NAME"
         log "Configuration: ${OCPUS} OCPU / ${MEMORY_GB} GB"
         log "--------------------------------------------"
+
+        ERROR_FILE="$(mktemp)"
 
         if OUTPUT="$(oci_ compute instance launch \
             --availability-domain "$AD" \
@@ -304,23 +337,25 @@ while true; do
             --boot-volume-size-in-gbs "$BOOT_GB" \
             --display-name "$NAME" \
             --ssh-authorized-keys-file "$SSH_PUBKEY_FILE" \
-            --output json 2>&1)"; then
+            --output json 2>"$ERROR_FILE")"; then
 
             INSTANCE_ID="$(
                 python3 -c '
 import json, sys
 try:
-    obj = json.load(sys.stdin)
-    print(obj.get("data", {}).get("id", ""))
+    data = json.load(sys.stdin)
+    print(data.get("data", {}).get("id", ""))
 except Exception:
     pass
 ' <<< "$OUTPUT"
             )"
 
+            rm -f "$ERROR_FILE"
+
             if [[ -n "$INSTANCE_ID" ]]; then
 
                 log "============================================"
-                log "SUCCESS! INSTANCE CREATION ACCEPTED!"
+                log "SUCCESS! INSTANCE ACCEPTED!"
                 log "============================================"
 
                 log "Instance OCID: $INSTANCE_ID"
@@ -338,34 +373,39 @@ except Exception:
 
             fi
 
-            log "Launch response did not contain an OCID."
-            log "Checking OCI to avoid duplicate launch."
+            log "Launch response has no instance OCID."
+            log "Checking for an accepted launch."
 
-            sleep 60
+            sleep 30
 
-            EXISTING="$(check_existing)" ||
-                die "Cannot verify ambiguous launch."
+            if EXISTING="$(check_existing)"; then
 
-            if [[ -n "$EXISTING" ]]; then
-                printf '%s\n' "$EXISTING" | tee "$SUCCESS_FILE"
-                exit 0
+                if [[ -n "$EXISTING" ]]; then
+                    printf '%s\n' "$EXISTING" > "$SUCCESS_FILE"
+                    log "Instance found: $EXISTING"
+                    exit 0
+                fi
+
+            else
+                die "Could not verify launch result."
             fi
 
             die "Ambiguous launch result. Check OCI Console."
 
         else
 
-            ERROR="$OUTPUT"
+            ERROR="$(cat "$ERROR_FILE")"
+            rm -f "$ERROR_FILE"
 
             if echo "$ERROR" | grep -qiE \
                 'OutOfHostCapacity|OutOfCapacity|out of (host )?capacity'; then
 
-                log "OUT OF CAPACITY: $AD"
+                log "OUT OF CAPACITY in $AD"
 
             elif echo "$ERROR" | grep -qiE \
                 'TooManyRequests|429|InternalServerError|InternalError|ExternalServerTimeout|ExternalServerUnreachable|503|timed out|connection reset'; then
 
-                log "TEMPORARY OCI/API ERROR"
+                log "TEMPORARY API ERROR"
                 echo "$ERROR"
 
                 DELAY=$((DELAY * 2))
@@ -379,7 +419,7 @@ except Exception:
                 log "NON-RETRYABLE ERROR:"
                 echo "$ERROR"
 
-                die "Please check OCI configuration and permissions."
+                die "OCI launch failed. Check configuration."
 
             fi
 
@@ -399,13 +439,12 @@ except Exception:
 
     WAIT=$((DELAY + RANDOM_WAIT))
 
-    log "No capacity available in this round."
+    log "No capacity available."
     log "Total attempts: $ATTEMPT"
     log "Next attempt in $WAIT seconds."
 
     sleep "$WAIT"
 
-    # Increase delay gradually.
     if (( DELAY < MAX_DELAY )); then
 
         DELAY=$((DELAY * 2))
