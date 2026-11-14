@@ -1,458 +1,365 @@
 
 #!/usr/bin/env bash
 
-# ============================================================
-# ORACLE CLOUD ALWAYS FREE A1 INSTANCE HUNTER
-# Singapore | VM.Standard.A1.Flex | 1 OCPU | 6 GB RAM
-# ============================================================
+set -u
 
-set -Eeuo pipefail
-
-# ------------------------------------------------------------
-# CONFIGURATION - ORIGINAL VARIABLE NAMES PRESERVED
-# ------------------------------------------------------------
+# ==========================================
+# OCI Always Free VM Creator
+# ==========================================
 
 PROFILE="${OCI_PROFILE:-DEFAULT}"
 CONFIG="${OCI_CLI_CONFIG_FILE:-$HOME/.oci/config}"
+
 REGION="${OCI_REGION:-ap-singapore-1}"
 
-NAME="${VM_NAME:-free-vm}"
-
-OCPUS="${OCPUS:-1}"
-MEMORY_GB="${MEMORY_GB:-6}"
-BOOT_GB="${BOOT_GB:-50}"
-
-SHAPE_KIND="${SHAPE:-A1}"
-
-INITIAL_DELAY="${SLEEP:-120}"
-MAX_DELAY=900
-JITTER=60
-
-MAX_A1_OCPUS=2
-MAX_A1_MEM=12
-
-SUCCESS_FILE="$HOME/oci-a1-success.txt"
-LOCK_FILE="/tmp/oci-a1-hunter.lock"
-
-# ------------------------------------------------------------
-# LOGGING
-# ------------------------------------------------------------
-
-log() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
-}
-
-die() {
-    log "FATAL: $*"
-    exit 1
-}
-
-# ------------------------------------------------------------
-# LOCK
-# ------------------------------------------------------------
-
-command -v flock >/dev/null 2>&1 ||
-    die "flock is not installed."
-
-exec 9>"$LOCK_FILE"
-
-if ! flock -n 9; then
-    log "Another hunter is already running."
-    exit 0
-fi
-
-# ------------------------------------------------------------
-# OCI WRAPPER
-# ------------------------------------------------------------
-
-oci_() {
-    oci --profile "$PROFILE" --region "$REGION" "$@"
-}
-
-# ------------------------------------------------------------
-# DEPENDENCIES
-# ------------------------------------------------------------
-
-command -v oci >/dev/null 2>&1 ||
-    die "OCI CLI not installed."
-
-command -v python3 >/dev/null 2>&1 ||
-    die "Python3 not installed."
-
-[[ -f "$CONFIG" ]] ||
-    die "OCI configuration file not found: $CONFIG"
-
-# ------------------------------------------------------------
-# TENANCY
-# ------------------------------------------------------------
-
-TENANCY="$(
-    awk -F= -v p="[$PROFILE]" '
-        $0==p { found=1; next }
-        /^\[/ { found=0 }
-        found && $1=="tenancy" {
-            print $2
-            exit
-        }
-    ' "$CONFIG" | tr -d ' '
-)"
-
-[[ -n "$TENANCY" ]] ||
-    die "Could not retrieve tenancy OCID."
+TENANCY="$(awk -F= -v p="[$PROFILE]" \
+  '$0==p{f=1;next} /^\[/{f=0} f&&$1=="tenancy"{print $2}' \
+  "$CONFIG" | tr -d ' ')"
 
 COMPARTMENT="${COMPARTMENT_ID:-$TENANCY}"
 
-# ------------------------------------------------------------
-# VALIDATION
-# ------------------------------------------------------------
+SHAPE_KIND="${SHAPE:-A1}"
+OCPUS="${OCPUS:-1}"
+MEMORY_GB="${MEMORY_GB:-6}"
+BOOT_GB="${BOOT_GB:-50}"
+NAME="${VM_NAME:-free-vm}"
 
-: "${SUBNET_ID:?SUBNET_ID is required}"
-: "${SSH_PUBKEY_FILE:?SSH_PUBKEY_FILE is required}"
+# Retry settings (seconds)
+SLEEP="${SLEEP:-300}"
+RATE_LIMIT_SLEEP="${RATE_LIMIT_SLEEP:-300}"
+MAX_RATE_LIMIT_SLEEP="${MAX_RATE_LIMIT_SLEEP:-3600}"
+INTERNAL_ERROR_SLEEP="${INTERNAL_ERROR_SLEEP:-600}"
 
-[[ -f "$SSH_PUBKEY_FILE" ]] ||
-    die "SSH public key file not found."
+# Configured A1 limits
+MAX_A1_OCPUS=4
+MAX_A1_MEM=24
 
-[[ "$OCPUS" =~ ^[0-9]+$ ]] ||
-    die "Invalid OCPUS."
-
-[[ "$MEMORY_GB" =~ ^[0-9]+$ ]] ||
-    die "Invalid MEMORY_GB."
-
-[[ "$BOOT_GB" =~ ^[0-9]+$ ]] ||
-    die "Invalid BOOT_GB."
-
-[[ "$INITIAL_DELAY" =~ ^[0-9]+$ ]] ||
-    die "Invalid SLEEP."
-
-(( INITIAL_DELAY >= 30 )) ||
-    die "SLEEP must be at least 30 seconds."
-
-# ------------------------------------------------------------
-# SHAPE
-# ------------------------------------------------------------
-
-if [[ "$SHAPE_KIND" != "A1" ]]; then
-    die "This script supports A1 only."
-fi
-
-SHAPE_NAME="VM.Standard.A1.Flex"
-
-(( OCPUS >= 1 && OCPUS <= MAX_A1_OCPUS )) ||
-    die "A1 Always Free allowance: maximum 2 OCPUs."
-
-(( MEMORY_GB >= OCPUS && MEMORY_GB <= MAX_A1_MEM )) ||
-    die "Invalid A1 memory allocation."
-
-(( BOOT_GB >= 47 && BOOT_GB <= 200 )) ||
-    die "Invalid boot volume size."
-
-SHAPE_ARGS=(
-    --shape-config
-    "{\"ocpus\":$OCPUS,\"memoryInGBs\":$MEMORY_GB}"
-)
-
-# ------------------------------------------------------------
-# STARTUP
-# ------------------------------------------------------------
-
-log "============================================"
-log "ORACLE A1 ALWAYS FREE HUNTER"
-log "============================================"
-
-log "Region:       $REGION"
-log "Profile:      $PROFILE"
-log "Compartment:  $COMPARTMENT"
-log "Shape:        $SHAPE_NAME"
-log "OCPU:         $OCPUS"
-log "Memory:       ${MEMORY_GB} GB"
-log "Boot volume:  ${BOOT_GB} GB"
-log "Name:         $NAME"
-
-log "============================================"
-
-# ------------------------------------------------------------
-# CHECK EXISTING INSTANCE
-# Exit 0: no instance found
-# Exit 0 with output: existing instance found
-# Exit 1: OCI/API error
-# ------------------------------------------------------------
-
-check_existing() {
-
-    local result
-    local error_file
-    local status
-
-    error_file="$(mktemp)"
-
-    if result="$(oci_ compute instance list \
-        --compartment-id "$COMPARTMENT" \
-        --all \
-        --output json 2>"$error_file")"; then
-        status=0
-    else
-        status=$?
-    fi
-
-    if (( status != 0 )); then
-        log "Failed to list existing instances:" >&2
-        cat "$error_file" >&2
-        rm -f "$error_file"
-        return 1
-    fi
-
-    rm -f "$error_file"
-
-    python3 -c '
-import json
-import sys
-
-name = sys.argv[1]
-
-try:
-    data = json.load(sys.stdin)
-except Exception as error:
-    print("Invalid OCI JSON response:", error, file=sys.stderr)
-    sys.exit(2)
-
-for item in data.get("data", []):
-    if item.get("display-name") == name:
-        state = item.get("lifecycle-state", "")
-
-        if state != "TERMINATED":
-            print(item.get("id", "") + "|" + state)
-            sys.exit(0)
-' "$NAME" <<< "$result"
+oci_() {
+  oci --profile "$PROFILE" --region "$REGION" "$@"
 }
 
-# ------------------------------------------------------------
-# INITIAL INSTANCE CHECK
-# ------------------------------------------------------------
+cmd="${1:-create}"
 
-if EXISTING="$(check_existing)"; then
+# ==========================================
+# Resize mode
+# ==========================================
 
-    if [[ -n "$EXISTING" ]]; then
-        log "Existing instance found: $EXISTING"
-        exit 0
+if [[ "$cmd" == "resize" ]]; then
+
+  INST="${2:?Instance OCID required}"
+
+  NEW_OCPUS="${OCPUS_NEW:-1}"
+  NEW_MEM="${MEMORY_NEW:-6}"
+
+  if (( NEW_OCPUS > MAX_A1_OCPUS || NEW_MEM > MAX_A1_MEM )); then
+    echo "ERROR: Exceeds configured A1 limits."
+    exit 1
+  fi
+
+  echo "Resizing instance: $INST"
+  echo "New configuration: ${NEW_OCPUS} OCPU / ${NEW_MEM} GB"
+
+  RATE_LIMIT_SLEEP=300
+
+  while true; do
+
+    out="$(oci_ compute instance update \
+      --instance-id "$INST" \
+      --shape-config "{\"ocpus\":$NEW_OCPUS,\"memoryInGBs\":$NEW_MEM}" \
+      --force 2>&1)"
+    status=$?
+
+    if (( status == 0 )); then
+      echo "$out"
+      echo "Resize request successful."
+      exit 0
     fi
 
-else
-    die "Could not check existing instances."
+    if echo "$out" | grep -qiE "TooManyRequests|429|rate.?limit"; then
+      echo "API rate limit. Waiting ${RATE_LIMIT_SLEEP}s..."
+      sleep "$RATE_LIMIT_SLEEP"
+
+      RATE_LIMIT_SLEEP=$((RATE_LIMIT_SLEEP * 2))
+      (( RATE_LIMIT_SLEEP > MAX_RATE_LIMIT_SLEEP )) && \
+        RATE_LIMIT_SLEEP="$MAX_RATE_LIMIT_SLEEP"
+
+    elif echo "$out" | grep -qi "InternalError"; then
+      echo "OCI internal error. Waiting ${INTERNAL_ERROR_SLEEP}s..."
+      sleep "$INTERNAL_ERROR_SLEEP"
+
+    elif echo "$out" | grep -qiE "out of (host )?capacity|capacity"; then
+      echo "Capacity unavailable. Waiting ${SLEEP}s..."
+      sleep "$SLEEP"
+
+    else
+      echo "FATAL: Resize failed."
+      echo "$out"
+      exit 1
+    fi
+
+  done
 fi
 
-# ------------------------------------------------------------
-# FIND UBUNTU IMAGE
-# ------------------------------------------------------------
+# ==========================================
+# Validate configuration
+# ==========================================
 
-log "Finding Ubuntu 22.04 image..."
+: "${SUBNET_ID:?Set SUBNET_ID to your public subnet OCID}"
+: "${SSH_PUBKEY_FILE:?Set SSH_PUBKEY_FILE to your public SSH key path}"
+
+if [[ ! -f "$SSH_PUBKEY_FILE" ]]; then
+  echo "ERROR: SSH public key file not found."
+  exit 1
+fi
+
+if [[ -z "$TENANCY" ]]; then
+  echo "ERROR: Could not read tenancy OCID from OCI config."
+  exit 1
+fi
+
+if [[ -z "$COMPARTMENT" ]]; then
+  echo "ERROR: Compartment OCID is missing."
+  exit 1
+fi
+
+# ==========================================
+# Select shape
+# ==========================================
+
+if [[ "$SHAPE_KIND" == "A1" ]]; then
+
+  SHAPE_NAME="VM.Standard.A1.Flex"
+
+  if (( OCPUS < 1 || OCPUS > MAX_A1_OCPUS ||
+        MEMORY_GB < 1 || MEMORY_GB > MAX_A1_MEM )); then
+    echo "ERROR: Invalid A1 configuration."
+    exit 1
+  fi
+
+  SHAPE_ARGS=(
+    --shape-config "{\"ocpus\":$OCPUS,\"memoryInGBs\":$MEMORY_GB}"
+  )
+
+else
+
+  SHAPE_NAME="VM.Standard.E2.1.Micro"
+  SHAPE_ARGS=()
+
+fi
+
+# ==========================================
+# Display configuration
+# ==========================================
+
+echo
+echo "=========================================="
+echo "OCI VM CREATION"
+echo "=========================================="
+echo "Region: $REGION"
+echo "Profile: $PROFILE"
+echo "Compartment: $COMPARTMENT"
+echo "Shape: $SHAPE_NAME"
+echo "OCPU: $OCPUS"
+echo "Memory: ${MEMORY_GB} GB"
+echo "Boot volume: ${BOOT_GB} GB"
+echo "Name: $NAME"
+echo "Capacity retry: ${SLEEP}s"
+echo "=========================================="
+echo
+
+# ==========================================
+# Get Ubuntu image
+# ==========================================
+
+echo "Finding Ubuntu 22.04 image..."
 
 IMAGE_ID="$(oci_ compute image list \
-    --compartment-id "$COMPARTMENT" \
-    --operating-system "Canonical Ubuntu" \
-    --operating-system-version "22.04" \
-    --shape "$SHAPE_NAME" \
-    --sort-by TIMECREATED \
-    --sort-order DESC \
-    --query 'data[0].id' \
-    --raw-output)" ||
-    die "Ubuntu image lookup failed."
+  --compartment-id "$COMPARTMENT" \
+  --operating-system "Canonical Ubuntu" \
+  --operating-system-version "22.04" \
+  --shape "$SHAPE_NAME" \
+  --sort-by TIMECREATED \
+  --sort-order DESC \
+  --query 'data[0].id' \
+  --raw-output 2>/tmp/oci_image_err)"
 
-[[ -n "$IMAGE_ID" && "$IMAGE_ID" != "null" ]] ||
-    die "No compatible Ubuntu image found."
+if [[ -z "$IMAGE_ID" || "$IMAGE_ID" == "null" ]]; then
+  echo "ERROR: Could not find compatible Ubuntu image."
+  cat /tmp/oci_image_err
+  exit 1
+fi
 
-log "Ubuntu image: $IMAGE_ID"
+echo "Image: $IMAGE_ID"
 
-# ------------------------------------------------------------
-# AVAILABILITY DOMAINS
-# ------------------------------------------------------------
+# ==========================================
+# Get availability domains
+# ==========================================
 
-log "Retrieving availability domains..."
+echo "Getting availability domains..."
 
-AD_JSON="$(oci_ iam availability-domain list \
-    --compartment-id "$TENANCY" \
-    --output json)" ||
-    die "Availability domain lookup failed."
+AD_OUTPUT="$(oci_ iam availability-domain list \
+  --compartment-id "$TENANCY" \
+  --query 'data[].name' \
+  --raw-output 2>/tmp/oci_ad_err)"
+AD_STATUS=$?
+
+if (( AD_STATUS != 0 )); then
+  echo "ERROR: Could not retrieve availability domains."
+  cat /tmp/oci_ad_err
+  exit 1
+fi
 
 mapfile -t ADS < <(
-    python3 -c '
-import json, sys
-for item in json.load(sys.stdin).get("data", []):
-    print(item["name"])
-' <<< "$AD_JSON"
+  printf '%s\n' "$AD_OUTPUT" |
+    tr -d '[]," ' |
+    grep -v '^$'
 )
 
-(( ${#ADS[@]} > 0 )) ||
-    die "No availability domains returned."
+if (( ${#ADS[@]} == 0 )); then
+  echo "ERROR: No availability domains found."
+  echo "$AD_OUTPUT"
+  exit 1
+fi
 
-log "Availability domains: ${ADS[*]}"
+echo "Availability domains: ${ADS[*]}"
 
-# ------------------------------------------------------------
-# RETRY LOOP
-# ------------------------------------------------------------
+# ==========================================
+# VM creation loop
+# ==========================================
 
-ATTEMPT=0
-DELAY="$INITIAL_DELAY"
+attempt=0
+RATE_LIMIT_SLEEP=300
 
 while true; do
 
-    log "============================================"
-    log "NEW CAPACITY CHECK ROUND"
-    log "============================================"
+  RATE_LIMITED=0
+  INTERNAL_ERROR=0
 
-    # Check for an existing VM before every round.
+  for AD in "${ADS[@]}"; do
 
-    if EXISTING="$(check_existing)"; then
+    attempt=$((attempt + 1))
 
-        if [[ -n "$EXISTING" ]]; then
-            log "Instance detected: $EXISTING"
-            printf '%s\n' "$EXISTING" > "$SUCCESS_FILE"
-            exit 0
-        fi
+    echo
+    echo "$(date) | Attempt $attempt | AD=$AD"
+    echo "Requesting VM creation..."
+
+    out="$(oci_ compute instance launch \
+      --availability-domain "$AD" \
+      --compartment-id "$COMPARTMENT" \
+      --shape "$SHAPE_NAME" \
+      "${SHAPE_ARGS[@]}" \
+      --image-id "$IMAGE_ID" \
+      --subnet-id "$SUBNET_ID" \
+      --assign-public-ip true \
+      --boot-volume-size-in-gbs "$BOOT_GB" \
+      --display-name "$NAME" \
+      --ssh-authorized-keys-file "$SSH_PUBKEY_FILE" 2>&1)"
+    status=$?
+
+    # ======================================
+    # SUCCESS: Stop immediately
+    # ======================================
+
+    if (( status == 0 )) && [[ "$out" == *'"lifecycle-state"'* ]]; then
+
+      echo
+      echo "=========================================="
+      echo "SUCCESS - VM CREATED!"
+      echo "=========================================="
+      echo "$out"
+      echo
+      echo "Stopping script. No more API requests."
+      exit 0
+
+    fi
+
+    # ======================================
+    # API rate limit
+    # ======================================
+
+    if echo "$out" | grep -qiE "TooManyRequests|429|rate.?limit"; then
+
+      echo "API rate limit detected."
+      RATE_LIMITED=1
+      break
+
+    # ======================================
+    # Internal OCI error
+    # ======================================
+
+    elif echo "$out" | grep -qi "InternalError"; then
+
+      echo "OCI internal error detected."
+      INTERNAL_ERROR=1
+      break
+
+    # ======================================
+    # Capacity unavailable
+    # ======================================
+
+    elif echo "$out" | grep -qiE "out of (host )?capacity|capacity"; then
+
+      echo "No capacity in $AD."
+      continue
+
+    # ======================================
+    # Other errors
+    # ======================================
 
     else
-        die "Existing-instance check failed."
-    fi
 
-    for AD in "${ADS[@]}"; do
-
-        ATTEMPT=$((ATTEMPT + 1))
-
-        log "--------------------------------------------"
-        log "Attempt: $ATTEMPT"
-        log "AD: $AD"
-        log "Shape: $SHAPE_NAME"
-        log "Configuration: ${OCPUS} OCPU / ${MEMORY_GB} GB"
-        log "--------------------------------------------"
-
-        ERROR_FILE="$(mktemp)"
-
-        if OUTPUT="$(oci_ compute instance launch \
-            --availability-domain "$AD" \
-            --compartment-id "$COMPARTMENT" \
-            --shape "$SHAPE_NAME" \
-            "${SHAPE_ARGS[@]}" \
-            --image-id "$IMAGE_ID" \
-            --subnet-id "$SUBNET_ID" \
-            --assign-public-ip true \
-            --boot-volume-size-in-gbs "$BOOT_GB" \
-            --display-name "$NAME" \
-            --ssh-authorized-keys-file "$SSH_PUBKEY_FILE" \
-            --output json 2>"$ERROR_FILE")"; then
-
-            INSTANCE_ID="$(
-                python3 -c '
-import json, sys
-try:
-    data = json.load(sys.stdin)
-    print(data.get("data", {}).get("id", ""))
-except Exception:
-    pass
-' <<< "$OUTPUT"
-            )"
-
-            rm -f "$ERROR_FILE"
-
-            if [[ -n "$INSTANCE_ID" ]]; then
-
-                log "============================================"
-                log "SUCCESS! INSTANCE ACCEPTED!"
-                log "============================================"
-
-                log "Instance OCID: $INSTANCE_ID"
-
-                {
-                    echo "INSTANCE_ID=$INSTANCE_ID"
-                    echo "REGION=$REGION"
-                    echo "SHAPE=$SHAPE_NAME"
-                    echo "OCPUS=$OCPUS"
-                    echo "MEMORY_GB=$MEMORY_GB"
-                    echo "CREATED=$(date -Is)"
-                } | tee "$SUCCESS_FILE"
-
-                exit 0
-
-            fi
-
-            log "Launch response has no instance OCID."
-            log "Checking for an accepted launch."
-
-            sleep 30
-
-            if EXISTING="$(check_existing)"; then
-
-                if [[ -n "$EXISTING" ]]; then
-                    printf '%s\n' "$EXISTING" > "$SUCCESS_FILE"
-                    log "Instance found: $EXISTING"
-                    exit 0
-                fi
-
-            else
-                die "Could not verify launch result."
-            fi
-
-            die "Ambiguous launch result. Check OCI Console."
-
-        else
-
-            ERROR="$(cat "$ERROR_FILE")"
-            rm -f "$ERROR_FILE"
-
-            if echo "$ERROR" | grep -qiE \
-                'OutOfHostCapacity|OutOfCapacity|out of (host )?capacity'; then
-
-                log "OUT OF CAPACITY in $AD"
-
-            elif echo "$ERROR" | grep -qiE \
-                'TooManyRequests|429|InternalServerError|InternalError|ExternalServerTimeout|ExternalServerUnreachable|503|timed out|connection reset'; then
-
-                log "TEMPORARY API ERROR"
-                echo "$ERROR"
-
-                DELAY=$((DELAY * 2))
-
-                if (( DELAY > MAX_DELAY )); then
-                    DELAY="$MAX_DELAY"
-                fi
-
-            else
-
-                log "NON-RETRYABLE ERROR:"
-                echo "$ERROR"
-
-                die "OCI launch failed. Check configuration."
-
-            fi
-
-        fi
-
-    done
-
-    # --------------------------------------------------------
-    # RANDOMIZED BACKOFF
-    # --------------------------------------------------------
-
-    RANDOM_WAIT=0
-
-    if (( JITTER > 0 )); then
-        RANDOM_WAIT=$((RANDOM % (JITTER + 1)))
-    fi
-
-    WAIT=$((DELAY + RANDOM_WAIT))
-
-    log "No capacity available."
-    log "Total attempts: $ATTEMPT"
-    log "Next attempt in $WAIT seconds."
-
-    sleep "$WAIT"
-
-    if (( DELAY < MAX_DELAY )); then
-
-        DELAY=$((DELAY * 2))
-
-        if (( DELAY > MAX_DELAY )); then
-            DELAY="$MAX_DELAY"
-        fi
+      echo
+      echo "=========================================="
+      echo "FATAL: VM creation failed."
+      echo "=========================================="
+      echo "$out"
+      exit 1
 
     fi
+
+  done
+
+  # ========================================
+  # Rate-limit backoff
+  # ========================================
+
+  if (( RATE_LIMITED == 1 )); then
+
+    echo
+    echo "Rate limit backoff: ${RATE_LIMIT_SLEEP} seconds."
+    sleep "$RATE_LIMIT_SLEEP"
+
+    RATE_LIMIT_SLEEP=$((RATE_LIMIT_SLEEP * 2))
+
+    if (( RATE_LIMIT_SLEEP > MAX_RATE_LIMIT_SLEEP )); then
+      RATE_LIMIT_SLEEP="$MAX_RATE_LIMIT_SLEEP"
+    fi
+
+  # ========================================
+  # Internal error retry
+  # ========================================
+
+  elif (( INTERNAL_ERROR == 1 )); then
+
+    echo
+    echo "Waiting ${INTERNAL_ERROR_SLEEP} seconds."
+    sleep "$INTERNAL_ERROR_SLEEP"
+
+  # ========================================
+  # All ADs checked: capacity retry
+  # ========================================
+
+  else
+
+    RATE_LIMIT_SLEEP=300
+
+    echo
+    echo "$(date) | All availability domains checked."
+    echo "No capacity available."
+    echo "Next retry in ${SLEEP} seconds."
+
+    sleep "$SLEEP"
+
+  fi
 
 done
